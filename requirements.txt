@@ -5,3 +5,5 @@ google-api-python-client
 pandas
 pdf2image
 pytesseract
+google-auth-oauthlib
+
