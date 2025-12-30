@@ -218,8 +218,14 @@ uploaded = st.file_uploader("Upload memo PDF (scanned is OK)", type=["pdf"])
 if uploaded:
     pdf_bytes = uploaded.read()
 
+    try:
     with st.spinner("Running OCR via Google Drive…"):
         text = drive_ocr_pdf_to_text(pdf_bytes, uploaded.name)
+except Exception as e:
+    st.error("OCR failed. This is the real error detail (copy/paste it to me):")
+    st.code(str(e))
+    st.stop()
+
 
     memo_no, items = parse_items_from_ocr_text(text)
 
