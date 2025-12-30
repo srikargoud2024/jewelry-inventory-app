@@ -1,0 +1,7 @@
+streamlit
+gspread
+google-auth
+google-api-python-client
+pandas
+pdf2image
+pytesseract
