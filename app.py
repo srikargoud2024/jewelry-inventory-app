@@ -8,7 +8,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-
+from googleapiclient.errors import HttpError
 
 st.set_page_config(page_title="Inventory Memo App", layout="wide")
 st.title("📦 Jewelry Inventory – Memo Upload")
@@ -33,54 +33,89 @@ ws_log = sh.worksheet("TRANSACTIONS_LOG")
 ITEM_RE = re.compile(r"\b(?:BR|BS|GB)[2-8][YW]-14K(?:-(?:1|2|3|4))?\b", re.I)
 MEMO_RE = re.compile(r"\bMemo\s*#\s*[:\-]?\s*([A-Z0-9\-]+)\b", re.I)
 
+
 def now_str():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
+
 def drive_ocr_pdf_to_text(pdf_bytes: bytes, filename: str) -> str:
     """
-    Upload PDF -> convert to Google Doc (OCR) -> export as text/plain -> delete temp file.
+    Reliable OCR flow for Streamlit Cloud:
+      1) Upload PDF as PDF
+      2) Copy/convert to Google Doc (OCR happens here)
+      3) Export Doc as text/plain
+      4) Delete temp files
     """
-    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
-
-    # Create a Google Doc from the PDF (Google does OCR during conversion)
-    created = drive.files().create(
-        body={
-            "name": f"OCR_{filename}_{int(datetime.now().timestamp())}",
-            "mimeType": "application/vnd.google-apps.document",
-        },
-        media_body=media,
-        fields="id",
-    ).execute()
-
-    file_id = created["id"]
+    pdf_file_id = None
+    doc_file_id = None
 
     try:
-        exported = drive.files().export(fileId=file_id, mimeType="text/plain").execute()
-        text = exported.decode("utf-8", errors="ignore")
-        return text
+        # 1) Upload PDF
+        media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
+        pdf_created = drive.files().create(
+            body={
+                "name": f"UPLOAD_{filename}_{int(datetime.now().timestamp())}",
+                "mimeType": "application/pdf",
+            },
+            media_body=media,
+            fields="id",
+        ).execute()
+        pdf_file_id = pdf_created["id"]
+
+        # 2) Convert by copying to Google Doc (OCR)
+        doc_created = drive.files().copy(
+            fileId=pdf_file_id,
+            body={
+                "name": f"OCR_{filename}_{int(datetime.now().timestamp())}",
+                "mimeType": "application/vnd.google-apps.document",
+            },
+            fields="id",
+        ).execute()
+        doc_file_id = doc_created["id"]
+
+        # 3) Export text
+        exported = drive.files().export(fileId=doc_file_id, mimeType="text/plain").execute()
+        return exported.decode("utf-8", errors="ignore")
+
+    except HttpError as e:
+        # Show real error details (safe)
+        try:
+            detail = e.content.decode("utf-8", errors="ignore")
+        except Exception:
+            detail = str(e)
+        raise RuntimeError(f"Drive OCR failed. Details: {detail}") from e
+
     finally:
-        # Always delete temp doc so Drive doesn't fill up
-        drive.files().delete(fileId=file_id).execute()
+        # 4) Cleanup temp files
+        try:
+            if doc_file_id:
+                drive.files().delete(fileId=doc_file_id).execute()
+        except Exception:
+            pass
+        try:
+            if pdf_file_id:
+                drive.files().delete(fileId=pdf_file_id).execute()
+        except Exception:
+            pass
+
 
 def parse_items_from_ocr_text(text: str) -> tuple[str | None, dict]:
     """
     Returns (memo_no, {item_code: qty})
-    Strategy:
-      - find memo number
-      - for each line containing an item_code, pick the nearest qty from the same line
+    For each line containing an item_code, pick the first integer in the same line as qty.
     """
     memo_no = None
     m = MEMO_RE.search(text)
     if m:
         memo_no = m.group(1).strip()
 
-    items = {}
+    items: dict[str, int] = {}
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
     for ln in lines:
         u = ln.upper()
 
-        # Skip non-inventory lines
+        # Ignore non-inventory lines
         if "SHIPPING" in u or "INSURANCE" in u:
             continue
 
@@ -90,15 +125,11 @@ def parse_items_from_ocr_text(text: str) -> tuple[str | None, dict]:
 
         code = code_match.group(0).upper()
 
-        # Quantity is usually a small integer near the start of the row.
-        # We'll take the first integer we see in the line.
         qty_match = re.search(r"\b(\d+)\b", ln)
         if not qty_match:
             continue
 
         qty = int(qty_match.group(1))
-
-        # Sanity filter: qty should not be crazy
         if qty <= 0 or qty > 999:
             continue
 
@@ -106,37 +137,39 @@ def parse_items_from_ocr_text(text: str) -> tuple[str | None, dict]:
 
     return memo_no, items
 
+
 def read_inventory_df() -> pd.DataFrame:
     data = ws_inventory.get_all_records()
     df = pd.DataFrame(data)
     if df.empty:
         return pd.DataFrame(columns=["item_code", "on_hand"])
+
     df["item_code"] = df["item_code"].astype(str).str.upper().str.strip()
-    # on_hand might be blank; coerce
     df["on_hand"] = pd.to_numeric(df["on_hand"], errors="coerce").fillna(0).astype(int)
     return df
 
+
 def memo_already_processed(memo_no: str) -> bool:
-    # quick check against log memo_no column
-    # log headers: timestamp, source, memo_no, item_code, qty_change, reason, user, notes
     log = ws_log.get_all_records()
+    target = memo_no.strip().upper()
     for r in log:
-        if str(r.get("memo_no", "")).strip().upper() == memo_no.strip().upper():
+        if str(r.get("memo_no", "")).strip().upper() == target:
             return True
     return False
+
 
 def apply_updates(preview_df: pd.DataFrame, memo_no: str | None, source: str, reason: str, user: str):
     inv_df = read_inventory_df().set_index("item_code")
 
     # Validate codes exist
-    missing = [c for c in preview_df["item_code"].tolist() if c not in inv_df.index]
+    missing = [c for c in preview_df["item_code"].tolist() if str(c).upper().strip() not in inv_df.index]
     if missing:
         raise ValueError(f"These item codes are not in INVENTORY sheet: {missing[:10]}")
 
-    # Calculate new stock and block negative
+    # Prepare updates and block negative stock
     updates = []
     for _, row in preview_df.iterrows():
-        code = row["item_code"].upper().strip()
+        code = str(row["item_code"]).upper().strip()
         qty = int(row["qty"])
         current = int(inv_df.loc[code, "on_hand"])
         new = current - qty
@@ -144,8 +177,7 @@ def apply_updates(preview_df: pd.DataFrame, memo_no: str | None, source: str, re
             raise ValueError(f"Negative stock not allowed: {code} would go {current} -> {new}")
         updates.append((code, new, -qty))
 
-    # Write inventory updates in one batch
-    # Find row numbers of each item_code in the sheet
+    # Batch update INVENTORY
     inv_all = ws_inventory.get_all_values()
     header = inv_all[0]
     code_col = header.index("item_code") + 1
@@ -165,7 +197,7 @@ def apply_updates(preview_df: pd.DataFrame, memo_no: str | None, source: str, re
 
     ws_inventory.update_cells(cell_updates)
 
-    # Append transactions log rows
+    # Append TRANSACTIONS_LOG rows
     ts = now_str()
     log_rows = []
     for code, _new_onhand, qty_change in updates:
@@ -197,20 +229,17 @@ if uploaded:
     col3.write(f"**Memo #:** {memo_no or 'Not detected'}")
 
     if not items:
-        st.error("No item codes detected. If this memo format changed, we may need to adjust parsing.")
+        st.error("No item codes detected. Expand 'Show raw OCR text' and share a snippet with me.")
         st.stop()
 
-    preview_df = pd.DataFrame(
-        [{"item_code": k, "qty": v} for k, v in sorted(items.items())]
-    )
+    preview_df = pd.DataFrame([{"item_code": k, "qty": v} for k, v in sorted(items.items())])
 
     st.subheader("Preview (edit if needed)")
     edited_df = st.data_editor(preview_df, num_rows="dynamic", use_container_width=True)
 
-    if memo_no:
-        if memo_already_processed(memo_no):
-            st.error(f"Memo {memo_no} was already processed. (Duplicate protection)")
-            st.stop()
+    if memo_no and memo_already_processed(memo_no):
+        st.error(f"Memo {memo_no} was already processed. (Duplicate protection)")
+        st.stop()
 
     st.divider()
     if st.button("✅ Confirm & Update Inventory", type="primary"):
@@ -222,6 +251,6 @@ if uploaded:
 
 st.divider()
 with st.expander("Show raw OCR text (for debugging)"):
-    st.write("If something is wrong, copy/paste this to me and I’ll fix the parser.")
+    st.write("If something is wrong, copy/paste a few lines here and I’ll fix the parser.")
     if "text" in locals():
         st.text(text[:15000])
