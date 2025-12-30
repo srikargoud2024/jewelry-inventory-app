@@ -8,7 +8,6 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
-from googleapiclient.errors import HttpError
 
 st.set_page_config(page_title="Inventory Memo App", layout="wide")
 st.title("📦 Jewelry Inventory – Memo Upload")
@@ -26,6 +25,7 @@ drive = build("drive", "v3", credentials=creds)
 
 SHEET_URL = st.secrets["sheet_url"]
 sh = gc.open_by_url(SHEET_URL)
+
 ws_inventory = sh.worksheet("INVENTORY")
 ws_log = sh.worksheet("TRANSACTIONS_LOG")
 
@@ -40,50 +40,47 @@ def now_str():
 
 def drive_ocr_pdf_to_text(pdf_bytes: bytes, filename: str) -> str:
     """
-    Reliable OCR flow for Streamlit Cloud:
-      1) Upload PDF as PDF
-      2) Copy/convert to Google Doc (OCR happens here)
-      3) Export Doc as text/plain
+    Streamlit Cloud safe OCR using Google Drive conversion:
+      1) Upload PDF into YOUR shared folder (uses your Drive quota)
+      2) Copy/convert to Google Doc (OCR happens during conversion)
+      3) Export doc as plain text
       4) Delete temp files
     """
     pdf_file_id = None
     doc_file_id = None
 
+    # Folder in YOUR Google Drive that you shared to service account
+    folder_id = st.secrets["ocr_folder_id"]
+
     try:
-        # 1) Upload PDF
+        # 1) Upload PDF to shared folder
         media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
         pdf_created = drive.files().create(
             body={
                 "name": f"UPLOAD_{filename}_{int(datetime.now().timestamp())}",
                 "mimeType": "application/pdf",
+                "parents": [folder_id],
             },
             media_body=media,
             fields="id",
         ).execute()
         pdf_file_id = pdf_created["id"]
 
-        # 2) Convert by copying to Google Doc (OCR)
+        # 2) Copy/convert to Google Doc (OCR)
         doc_created = drive.files().copy(
             fileId=pdf_file_id,
             body={
                 "name": f"OCR_{filename}_{int(datetime.now().timestamp())}",
                 "mimeType": "application/vnd.google-apps.document",
+                "parents": [folder_id],
             },
             fields="id",
         ).execute()
         doc_file_id = doc_created["id"]
 
-        # 3) Export text
+        # 3) Export to plain text
         exported = drive.files().export(fileId=doc_file_id, mimeType="text/plain").execute()
         return exported.decode("utf-8", errors="ignore")
-
-    except HttpError as e:
-        # Show real error details (safe)
-        try:
-            detail = e.content.decode("utf-8", errors="ignore")
-        except Exception:
-            detail = str(e)
-        raise RuntimeError(f"Drive OCR failed. Details: {detail}") from e
 
     finally:
         # 4) Cleanup temp files
@@ -219,13 +216,12 @@ if uploaded:
     pdf_bytes = uploaded.read()
 
     try:
-    with st.spinner("Running OCR via Google Drive…"):
-        text = drive_ocr_pdf_to_text(pdf_bytes, uploaded.name)
-except Exception as e:
-    st.error("OCR failed. This is the real error detail (copy/paste it to me):")
-    st.code(str(e))
-    st.stop()
-
+        with st.spinner("Running OCR via Google Drive…"):
+            text = drive_ocr_pdf_to_text(pdf_bytes, uploaded.name)
+    except Exception as e:
+        st.error("OCR failed. Copy/paste this error to me:")
+        st.code(str(e))
+        st.stop()
 
     memo_no, items = parse_items_from_ocr_text(text)
 
