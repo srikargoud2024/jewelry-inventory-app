@@ -5,23 +5,29 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 import gspread
-from google.oauth2.service_account import Credentials
+
+from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-st.set_page_config(page_title="Inventory Memo App", layout="wide")
+# ----------------- PAGE -----------------
+st.set_page_config(page_title="Jewelry Inventory – Memo Upload", layout="wide")
 st.title("📦 Jewelry Inventory – Memo Upload")
-st.caption("Upload memo PDF → auto extract items → preview → confirm → updates Google Sheets")
+st.caption("Upload memo PDF → Google Login OCR → preview → confirm → updates inventory")
 
-# ----------------- Google Auth -----------------
-SCOPES = [
+# ----------------- SHEETS (SERVICE ACCOUNT) -----------------
+SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 
-gc = gspread.authorize(creds)
-drive = build("drive", "v3", credentials=creds)
+sa_creds = SACredentials.from_service_account_info(
+    st.secrets["gcp_service_account"],
+    scopes=SHEETS_SCOPES,
+)
+gc = gspread.authorize(sa_creds)
 
 SHEET_URL = st.secrets["sheet_url"]
 sh = gc.open_by_url(SHEET_URL)
@@ -29,7 +35,105 @@ sh = gc.open_by_url(SHEET_URL)
 ws_inventory = sh.worksheet("INVENTORY")
 ws_log = sh.worksheet("TRANSACTIONS_LOG")
 
-# ----------------- Regex -----------------
+# ----------------- OAUTH (USER LOGIN FOR DRIVE OCR) -----------------
+OAUTH_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+CLIENT_ID = st.secrets["google_oauth_client_id"]
+CLIENT_SECRET = st.secrets["google_oauth_client_secret"]
+REDIRECT_URI = st.secrets["redirect_uri"]
+
+
+def build_flow():
+    config = {
+        "web": {
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    }
+    return Flow.from_client_config(
+        config,
+        scopes=OAUTH_SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+
+
+def handle_oauth_callback():
+    params = st.query_params
+    code = params.get("code")
+    if not code:
+        return
+
+    flow = build_flow()
+    flow.fetch_token(code=code)
+
+    creds = flow.credentials
+    st.session_state["oauth_token"] = {
+        "access_token": creds.token,
+        "refresh_token": creds.refresh_token,
+    }
+
+    st.query_params.clear()
+    st.success("Google login successful ✅")
+
+
+def get_drive_service():
+    token = st.session_state.get("oauth_token")
+    if not token:
+        return None
+
+    creds = UserCredentials(
+        token=token["access_token"],
+        refresh_token=token.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        scopes=OAUTH_SCOPES,
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+# Run callback handler first
+handle_oauth_callback()
+
+# ----------------- SIDEBAR -----------------
+with st.sidebar:
+    st.header("Settings")
+    employee = st.text_input("Employee name", value="Employee")
+    reason = st.selectbox(
+        "Reason",
+        ["Sale", "Amazon", "Adjustment", "Return", "Damage"],
+        index=0,
+    )
+
+    if st.session_state.get("oauth_token"):
+        if st.button("Log out (Google OCR)"):
+            st.session_state.pop("oauth_token", None)
+            st.experimental_rerun()
+
+# ----------------- LOGIN GATE -----------------
+drive = get_drive_service()
+
+if drive is None:
+    st.subheader("🔐 Google Login required for OCR")
+    st.info("Google blocks Drive storage for service accounts. Login once to use your Drive for OCR.")
+
+    flow = build_flow()
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+
+    st.link_button("Login with Google", auth_url)
+    st.stop()
+
+# ----------------- REGEX -----------------
 ITEM_RE = re.compile(r"\b(?:BR|BS|GB)[2-8][YW]-14K(?:-(?:1|2|3|4))?\b", re.I)
 MEMO_RE = re.compile(r"\bMemo\s*#\s*[:\-]?\s*([A-Z0-9\-]+)\b", re.I)
 
@@ -38,52 +142,43 @@ def now_str():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ----------------- OCR -----------------
 def drive_ocr_pdf_to_text(pdf_bytes: bytes, filename: str) -> str:
-    """
-    Streamlit Cloud safe OCR using Google Drive conversion:
-      1) Upload PDF into YOUR shared folder (uses your Drive quota)
-      2) Copy/convert to Google Doc (OCR happens during conversion)
-      3) Export doc as plain text
-      4) Delete temp files
-    """
     pdf_file_id = None
     doc_file_id = None
 
-    # Folder in YOUR Google Drive that you shared to service account
-    folder_id = st.secrets["ocr_folder_id"]
-
     try:
-        # 1) Upload PDF to shared folder
-        media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype="application/pdf", resumable=False)
+        media = MediaIoBaseUpload(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            resumable=False,
+        )
+
         pdf_created = drive.files().create(
-            body={
-                "name": f"UPLOAD_{filename}_{int(datetime.now().timestamp())}",
-                "mimeType": "application/pdf",
-                "parents": [folder_id],
-            },
+            body={"name": f"UPLOAD_{filename}_{int(datetime.now().timestamp())}"},
             media_body=media,
             fields="id",
         ).execute()
         pdf_file_id = pdf_created["id"]
 
-        # 2) Copy/convert to Google Doc (OCR)
         doc_created = drive.files().copy(
             fileId=pdf_file_id,
             body={
                 "name": f"OCR_{filename}_{int(datetime.now().timestamp())}",
                 "mimeType": "application/vnd.google-apps.document",
-                "parents": [folder_id],
             },
             fields="id",
         ).execute()
         doc_file_id = doc_created["id"]
 
-        # 3) Export to plain text
-        exported = drive.files().export(fileId=doc_file_id, mimeType="text/plain").execute()
+        exported = drive.files().export(
+            fileId=doc_file_id,
+            mimeType="text/plain",
+        ).execute()
+
         return exported.decode("utf-8", errors="ignore")
 
     finally:
-        # 4) Cleanup temp files
         try:
             if doc_file_id:
                 drive.files().delete(fileId=doc_file_id).execute()
@@ -96,163 +191,116 @@ def drive_ocr_pdf_to_text(pdf_bytes: bytes, filename: str) -> str:
             pass
 
 
-def parse_items_from_ocr_text(text: str) -> tuple[str | None, dict]:
-    """
-    Returns (memo_no, {item_code: qty})
-    For each line containing an item_code, pick the first integer in the same line as qty.
-    """
+# ----------------- PARSE -----------------
+def parse_items(text: str):
     memo_no = None
     m = MEMO_RE.search(text)
     if m:
-        memo_no = m.group(1).strip()
+        memo_no = m.group(1)
 
-    items: dict[str, int] = {}
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    for ln in lines:
+    items = {}
+    for ln in text.splitlines():
         u = ln.upper()
-
-        # Ignore non-inventory lines
         if "SHIPPING" in u or "INSURANCE" in u:
             continue
 
-        code_match = ITEM_RE.search(ln)
-        if not code_match:
+        code = ITEM_RE.search(ln)
+        if not code:
             continue
 
-        code = code_match.group(0).upper()
-
-        qty_match = re.search(r"\b(\d+)\b", ln)
-        if not qty_match:
+        qty = re.search(r"\b(\d+)\b", ln)
+        if not qty:
             continue
 
-        qty = int(qty_match.group(1))
-        if qty <= 0 or qty > 999:
+        q = int(qty.group(1))
+        if q <= 0 or q > 999:
             continue
 
-        items[code] = items.get(code, 0) + qty
+        items[code.group(0).upper()] = items.get(code.group(0).upper(), 0) + q
 
     return memo_no, items
 
 
-def read_inventory_df() -> pd.DataFrame:
-    data = ws_inventory.get_all_records()
-    df = pd.DataFrame(data)
-    if df.empty:
-        return pd.DataFrame(columns=["item_code", "on_hand"])
-
-    df["item_code"] = df["item_code"].astype(str).str.upper().str.strip()
+# ----------------- INVENTORY -----------------
+def read_inventory():
+    df = pd.DataFrame(ws_inventory.get_all_records())
+    df["item_code"] = df["item_code"].astype(str).str.upper()
     df["on_hand"] = pd.to_numeric(df["on_hand"], errors="coerce").fillna(0).astype(int)
-    return df
+    return df.set_index("item_code")
 
 
-def memo_already_processed(memo_no: str) -> bool:
-    log = ws_log.get_all_records()
-    target = memo_no.strip().upper()
-    for r in log:
-        if str(r.get("memo_no", "")).strip().upper() == target:
+def memo_exists(memo_no):
+    for r in ws_log.get_all_records():
+        if str(r.get("memo_no", "")).strip() == str(memo_no):
             return True
     return False
 
 
-def apply_updates(preview_df: pd.DataFrame, memo_no: str | None, source: str, reason: str, user: str):
-    inv_df = read_inventory_df().set_index("item_code")
+def apply_updates(df_preview, memo_no):
+    inv = read_inventory()
 
-    # Validate codes exist
-    missing = [c for c in preview_df["item_code"].tolist() if str(c).upper().strip() not in inv_df.index]
-    if missing:
-        raise ValueError(f"These item codes are not in INVENTORY sheet: {missing[:10]}")
-
-    # Prepare updates and block negative stock
     updates = []
-    for _, row in preview_df.iterrows():
-        code = str(row["item_code"]).upper().strip()
-        qty = int(row["qty"])
-        current = int(inv_df.loc[code, "on_hand"])
-        new = current - qty
+    for _, r in df_preview.iterrows():
+        code = r["item_code"]
+        qty = int(r["qty"])
+        new = inv.loc[code, "on_hand"] - qty
         if new < 0:
-            raise ValueError(f"Negative stock not allowed: {code} would go {current} -> {new}")
+            raise ValueError(f"Negative stock: {code}")
         updates.append((code, new, -qty))
 
-    # Batch update INVENTORY
     inv_all = ws_inventory.get_all_values()
     header = inv_all[0]
     code_col = header.index("item_code") + 1
-    onhand_col = header.index("on_hand") + 1
+    qty_col = header.index("on_hand") + 1
 
-    code_to_row = {}
-    for i, row in enumerate(inv_all[1:], start=2):
-        if len(row) >= code_col:
-            code_to_row[row[code_col - 1].strip().upper()] = i
+    code_row = {
+        row[code_col - 1].upper(): i + 2
+        for i, row in enumerate(inv_all[1:])
+    }
 
-    cell_updates = []
-    for code, new_onhand, _qty_change in updates:
-        r = code_to_row.get(code)
-        if not r:
-            raise ValueError(f"Could not locate {code} row in INVENTORY sheet.")
-        cell_updates.append(gspread.Cell(r, onhand_col, str(new_onhand)))
+    cells = []
+    for code, new_qty, _ in updates:
+        cells.append(gspread.Cell(code_row[code], qty_col, str(new_qty)))
 
-    ws_inventory.update_cells(cell_updates)
+    ws_inventory.update_cells(cells)
 
-    # Append TRANSACTIONS_LOG rows
     ts = now_str()
-    log_rows = []
-    for code, _new_onhand, qty_change in updates:
-        log_rows.append([ts, source, memo_no or "", code, qty_change, reason, user, ""])
-    ws_log.append_rows(log_rows, value_input_option="USER_ENTERED")
+    logs = []
+    for code, _, chg in updates:
+        logs.append([ts, "Memo PDF", memo_no or "", code, chg, reason, employee, ""])
+
+    ws_log.append_rows(logs, value_input_option="USER_ENTERED")
 
 
 # ----------------- UI -----------------
-with st.sidebar:
-    st.header("Settings")
-    user = st.text_input("Employee name", value="Employee")
-    reason = st.selectbox("Reason", ["Sale", "Amazon", "Adjustment", "Return", "Damage"], index=0)
-    st.divider()
-    st.caption("Tip: If Streamlit ever fails, use your Google Form backup.")
-
-uploaded = st.file_uploader("Upload memo PDF (scanned is OK)", type=["pdf"])
+uploaded = st.file_uploader("Upload memo PDF", type=["pdf"])
 
 if uploaded:
-    pdf_bytes = uploaded.read()
+    with st.spinner("Running OCR…"):
+        text = drive_ocr_pdf_to_text(uploaded.read(), uploaded.name)
 
-    try:
-        with st.spinner("Running OCR via Google Drive…"):
-            text = drive_ocr_pdf_to_text(pdf_bytes, uploaded.name)
-    except Exception as e:
-        st.error("OCR failed. Copy/paste this error to me:")
-        st.code(str(e))
-        st.stop()
-
-    memo_no, items = parse_items_from_ocr_text(text)
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Detected items", len(items))
-    col2.metric("Total qty", sum(items.values()) if items else 0)
-    col3.write(f"**Memo #:** {memo_no or 'Not detected'}")
+    memo_no, items = parse_items(text)
 
     if not items:
-        st.error("No item codes detected. Expand 'Show raw OCR text' and share a snippet with me.")
+        st.error("No item codes detected.")
         st.stop()
 
-    preview_df = pd.DataFrame([{"item_code": k, "qty": v} for k, v in sorted(items.items())])
+    st.write(f"**Memo #:** {memo_no or 'Not detected'}")
 
-    st.subheader("Preview (edit if needed)")
-    edited_df = st.data_editor(preview_df, num_rows="dynamic", use_container_width=True)
+    df_preview = pd.DataFrame(
+        [{"item_code": k, "qty": v} for k, v in sorted(items.items())]
+    )
 
-    if memo_no and memo_already_processed(memo_no):
-        st.error(f"Memo {memo_no} was already processed. (Duplicate protection)")
+    st.subheader("Preview")
+    edited = st.data_editor(df_preview, use_container_width=True)
+
+    if memo_no and memo_exists(memo_no):
+        st.error("This memo was already processed.")
         st.stop()
 
-    st.divider()
-    if st.button("✅ Confirm & Update Inventory", type="primary"):
+    if st.button("✅ Confirm & Update Inventory"):
         try:
-            apply_updates(edited_df, memo_no, source="Memo PDF", reason=reason, user=user)
-            st.success("Inventory updated and transactions logged.")
+            apply_updates(edited, memo_no)
+            st.success("Inventory updated successfully 🎉")
         except Exception as e:
-            st.error(f"Update failed: {e}")
-
-st.divider()
-with st.expander("Show raw OCR text (for debugging)"):
-    st.write("If something is wrong, copy/paste a few lines here and I’ll fix the parser.")
-    if "text" in locals():
-        st.text(text[:15000])
+            st.error(str(e))
